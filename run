@@ -1,0 +1,2 @@
+#!/bin/bash
+locust -f tasks.py --host="https://api.dev.boundlessgeo.io"
