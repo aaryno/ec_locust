@@ -1,2 +1,6 @@
 #!/bin/bash
-locust -f tasks.py --host="https://api.dev.boundlessgeo.io"
+if [ -z "$1" ]; then
+    echo "please specify a URL"
+    exit 1
+fi
+env/bin/locust -f tasks.py --host="$1"
