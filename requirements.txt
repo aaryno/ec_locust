@@ -1,1 +1,2 @@
 locustio==0.8a2
+lxml
