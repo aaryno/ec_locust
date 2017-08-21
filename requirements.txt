@@ -1,3 +1,4 @@
+mercantile
 locustio==0.8a2
 pyzmq
 lxml

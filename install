@@ -1,8 +1,0 @@
-#!/bin/bash
-if ! virtualenv --version; then
-    pip install virtualenv
-fi
-if [ ! -d env ]; then
-    virtualenv env
-fi
-env/bin/pip install --upgrade -r requirements.txt
