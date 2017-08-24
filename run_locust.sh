@@ -26,5 +26,8 @@ if [ ! -f "wms_256_tiles.csv" ]; then
     ./mercantile_gen.py
 fi
 
-LOGLEVEL=CRITICAL
+$LOCUST --version
+
+LOGLEVEL=INFO
+echo "Starting locust: $LOCUST (log level $LOGLEVEL)"
 $LOCUST -f ./wms_tester.py --loglevel="$LOGLEVEL" --host="$URL"
