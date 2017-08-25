@@ -22,12 +22,12 @@ else
 fi
 
 # build data file if it is not present
-if [ ! -f "wms_256_tiles.csv" ]; then
-    ./mercantile_gen.py
+if [ ! -f "./data/wms_256_tiles.csv" ]; then
+    ./code/mercantile_gen.py
 fi
 
 $LOCUST --version
 
 LOGLEVEL=INFO
 echo "Starting locust: $LOCUST (log level $LOGLEVEL)"
-$LOCUST -f ./wms_tester.py --loglevel="$LOGLEVEL" --host="$URL"
+$LOCUST -f ./code/wms_tester.py --loglevel="$LOGLEVEL" --host="$URL"
