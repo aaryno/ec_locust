@@ -164,6 +164,9 @@ async def retry(label, async_function, args=None, kwargs=None, max_fails=1):
             # Stop the timer without bothering to read
             result.end = time.monotonic()
 
+            # wait a bit to avoid being rude with very high request volume
+            await asyncio.sleep(1)
+
     return results
 
 
