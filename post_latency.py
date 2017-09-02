@@ -154,7 +154,7 @@ async def retry(label, async_function, args=None, kwargs=None, max_fails=1):
                 # geoserver doesn't seem to be giving up content-length,
                 # so we'll just keep it all in RAM here, whatever
                 result.length = len(body)
-                result.type = response.headers["content-type"]
+                result.type = response.headers.get("content-type")
 
                 # Looks good, let's stop retrying
                 break
