@@ -267,7 +267,7 @@ async def test_node(session, node_name, options):
             <name>openstreetmap</name>
             <connectionParameters>
                 <host>
-                {database_host}
+                {options.database_host}
                 </host>
                 <port>{options.database_port}</port>
                 <database>{options.database_name}</database>
