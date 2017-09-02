@@ -225,7 +225,7 @@ async def test_node(session, node_name, options):
     # mystery parameters
     workspace = "osm"
     datastore = "openstreetmap"
-    layer_name = "ft0001"
+    layer_name = "water"
 
     # Make sure we have an osm workspace I guess
     workspace_args = [
