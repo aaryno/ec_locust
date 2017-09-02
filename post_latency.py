@@ -249,6 +249,11 @@ async def test_node(session, node_name, options):
     if not workspace_results or not workspace_results[-1].success:
         return result
 
+    # database_host = "osm-test-chesapeake.cs5ahh3rwygg.us-east-1.rds.amazonaws.com"
+    # database_port = "5432"
+    # database_name = "osm"
+    # database_user = "geoserver"
+    # database_password = "geoserver"
     datastore_args = [
         f"{base_url}/rest/workspaces/{workspace}/datastores",
     ]
@@ -257,17 +262,17 @@ async def test_node(session, node_name, options):
             "Content-Type": "text/xml",
         },
         # magic parameters
-        "data": """
+        "data": f"""
             <dataStore>
             <name>openstreetmap</name>
             <connectionParameters>
                 <host>
-                osm-test-chesapeake.cs5ahh3rwygg.us-east-1.rds.amazonaws.com
+                {database_host}
                 </host>
-                <port>5432</port>
-                <database>osm</database>
-                <user>geoserver</user>
-                <passwd>geoserver</passwd>
+                <port>{options.database_port}</port>
+                <database>{options.database_name}</database>
+                <user>{options.database_user}</user>
+                <passwd>{options.database_password}</passwd>
                 <dbtype>postgis</dbtype>
             </connectionParameters>
             </dataStore>
