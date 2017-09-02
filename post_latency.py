@@ -22,6 +22,26 @@ def argument_parser():
         dest="node_names",
         nargs="+",
     )
+    parser.add_argument(
+        "--database-host",
+        default="osm-test-chesapeake.cs5ahh3rwygg.us-east-1.rds.amazonaws.com",
+    )
+    parser.add_argument(
+        "--database-port",
+        default="5432",
+    )
+    parser.add_argument(
+        "--database-name",
+        default="osm",
+    )
+    parser.add_argument(
+        "--database-user",
+        default="geoserver",
+    )
+    parser.add_argument(
+        "--database-password",
+        default="geoserver",
+    )
     return parser
 
 
