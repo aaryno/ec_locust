@@ -133,7 +133,7 @@ async def retry(label, async_function, args=None, kwargs=None, max_fails=1):
             if result.status == 500:
                 body = await response.read()
                 result.length = len(body)
-                result.type = response.headers["content-type"]
+                result.type = response.headers.get("content-type")
                 if (
                     result.type.startswith("text/plain")
                     and b"already exists" in body
