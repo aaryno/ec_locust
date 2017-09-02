@@ -194,7 +194,7 @@ async def retry(label, async_function, args=None, kwargs=None, max_fails=1):
     return results
 
 
-async def test_node(session, node_name):
+async def test_node(session, node_name, options):
     # this coro contains the whole flow for one node
     # it returns report information on that node at the end
 
@@ -335,7 +335,7 @@ async def test_node(session, node_name):
     return result
 
 
-async def test_nodes(node_names):
+async def test_nodes(options):
 
     # this coro runs test_node once for each node
     # it aggregates their report information
@@ -348,7 +348,10 @@ async def test_nodes(node_names):
     auth = aiohttp.BasicAuth(username, password)
     async with aiohttp.ClientSession(auth=auth) as session:
 
-        futures = [test_node(session, node_name) for node_name in node_names]
+        futures = [
+            test_node(session, node_name, options)
+            for node_name in options.node_names
+        ]
         logging.debug(f"futures: {futures}")
 
         # results = await asyncio.gather(*futures, return_exceptions=True)
@@ -425,7 +428,7 @@ def main():
     parser = argument_parser()
     options = parser.parse_args()
     LOG.debug(f"options: {options}")
-    results = run(test_nodes, options.node_names)
+    results = run(test_nodes, options)
     report(results)
 
 
