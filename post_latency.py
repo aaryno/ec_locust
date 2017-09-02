@@ -94,7 +94,11 @@ class NodeResult:
 
     @property
     def post_end(self):
-        return self.post_result.end if self.post_result else None
+        return (
+            self.featuretype_result.end
+            if self.featuretype_result
+            else None
+        )
 
     @property
     def latency(self):
