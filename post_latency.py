@@ -22,6 +22,26 @@ def argument_parser():
         dest="node_names",
         nargs="+",
     )
+    parser.add_argument(
+        "--database-host",
+        default="osm-test-chesapeake.cs5ahh3rwygg.us-east-1.rds.amazonaws.com",
+    )
+    parser.add_argument(
+        "--database-port",
+        default="5432",
+    )
+    parser.add_argument(
+        "--database-name",
+        default="osm",
+    )
+    parser.add_argument(
+        "--database-user",
+        default="geoserver",
+    )
+    parser.add_argument(
+        "--database-password",
+        default="geoserver",
+    )
     return parser
 
 
@@ -55,6 +75,7 @@ class NodeResult:
         self.datastore_results = None
         self.featuretype_results = None
         self.get_results = None
+        self.delete_workspace_results = None
 
     @property
     def get_result(self):
@@ -67,6 +88,10 @@ class NodeResult:
     @property
     def datastore_result(self):
         return self.datastore_results[-1] if self.datastore_results else None
+
+    @property
+    def delete_workspace_result(self):
+        return self.delete_workspace_results[-1] if self.delete_workspace_results else None
 
     @property
     def featuretype_result(self):
@@ -85,6 +110,10 @@ class NodeResult:
         return self.datastore_result.duration if self.datastore_result else None
 
     @property
+    def delete_workspace_duration(self):
+        return self.delete_workspace_result.duration if self.delete_workspace_result else None
+
+    @property
     def featuretype_duration(self):
         return self.featuretype_result.duration if self.featuretype_result else None
 
@@ -94,7 +123,11 @@ class NodeResult:
 
     @property
     def post_end(self):
-        return self.post_result.end if self.post_result else None
+        return (
+            self.featuretype_result.end
+            if self.featuretype_result
+            else None
+        )
 
     @property
     def latency(self):
@@ -133,7 +166,7 @@ async def retry(label, async_function, args=None, kwargs=None, max_fails=1):
             if result.status == 500:
                 body = await response.read()
                 result.length = len(body)
-                result.type = response.headers["content-type"]
+                result.type = response.headers.get("content-type")
                 if (
                     result.type.startswith("text/plain")
                     and b"already exists" in body
@@ -154,7 +187,7 @@ async def retry(label, async_function, args=None, kwargs=None, max_fails=1):
                 # geoserver doesn't seem to be giving up content-length,
                 # so we'll just keep it all in RAM here, whatever
                 result.length = len(body)
-                result.type = response.headers["content-type"]
+                result.type = response.headers.get("content-type")
 
                 # Looks good, let's stop retrying
                 break
@@ -164,15 +197,19 @@ async def retry(label, async_function, args=None, kwargs=None, max_fails=1):
             # Stop the timer without bothering to read
             result.end = time.monotonic()
 
+            # wait a bit to avoid being rude with very high request volume
+            await asyncio.sleep(1)
+
     return results
 
 
-async def test_node(session, node_name):
+async def test_node(session, node_name, options):
     # this coro contains the whole flow for one node
     # it returns report information on that node at the end
 
     max_post_fails = 2
     max_get_fails = 10
+    max_delete_fails = 2
 
     base_url = f"http://{node_name}/geoserver"
     query_string = urlencode({
@@ -181,7 +218,7 @@ async def test_node(session, node_name):
         "REQUEST": "GetMap",
         "FORMAT": "image/png",
         "TRANSPARENT": "true",
-        "LAYERS": "osm:osm",
+        "LAYERS": "osm:water",
         "TILED": "true",
         "WIDTH": "512",
         "HEIGHT": "512",
@@ -198,7 +235,7 @@ async def test_node(session, node_name):
     # mystery parameters
     workspace = "osm"
     datastore = "openstreetmap"
-    layer_name = "ft0001"
+    layer_name = "water"
 
     # Make sure we have an osm workspace I guess
     workspace_args = [
@@ -222,6 +259,11 @@ async def test_node(session, node_name):
     if not workspace_results or not workspace_results[-1].success:
         return result
 
+    # database_host = "osm-test-chesapeake.cs5ahh3rwygg.us-east-1.rds.amazonaws.com"
+    # database_port = "5432"
+    # database_name = "osm"
+    # database_user = "geoserver"
+    # database_password = "geoserver"
     datastore_args = [
         f"{base_url}/rest/workspaces/{workspace}/datastores",
     ]
@@ -230,17 +272,15 @@ async def test_node(session, node_name):
             "Content-Type": "text/xml",
         },
         # magic parameters
-        "data": """
+        "data": f"""
             <dataStore>
             <name>openstreetmap</name>
             <connectionParameters>
-                <host>
-                osm-test-chesapeake.cs5ahh3rwygg.us-east-1.rds.amazonaws.com
-                </host>
-                <port>5432</port>
-                <database>osm</database>
-                <user>geoserver</user>
-                <passwd>geoserver</passwd>
+                <host>{options.database_host}</host>
+                <port>{options.database_port}</port>
+                <database>{options.database_name}</database>
+                <user>{options.database_user}</user>
+                <passwd>{options.database_password}</passwd>
                 <dbtype>postgis</dbtype>
             </connectionParameters>
             </dataStore>
@@ -260,9 +300,9 @@ async def test_node(session, node_name):
 
     featuretype_args = [
         (
-            f"{base_url}/workspaces/{workspace}"
+            f"{base_url}/rest/workspaces/{workspace}"
             f"/datastores/{datastore}"
-            f"/featuretypes?recalculate=nativebbox,latlonbbox"
+            f"/featuretypes"
         ),
     ]
     featuretype_kwargs = {
@@ -304,11 +344,22 @@ async def test_node(session, node_name):
         max_fails=max_get_fails,
     )
     result.get_results = get_results
-
+    
+    delete_workspace_args = [
+        f"{base_url}/rest/workspaces/{workspace}?recurse=true",
+    ]    
+    delete_results = await retry(
+        "DELETE",
+        session.delete,
+        args=delete_workspace_args,
+        kwargs={},
+        max_fails=max_delete_fails,
+    )
+    result.delete_workspace_results = delete_results
     return result
 
 
-async def test_nodes(node_names):
+async def test_nodes(options):
 
     # this coro runs test_node once for each node
     # it aggregates their report information
@@ -321,7 +372,10 @@ async def test_nodes(node_names):
     auth = aiohttp.BasicAuth(username, password)
     async with aiohttp.ClientSession(auth=auth) as session:
 
-        futures = [test_node(session, node_name) for node_name in node_names]
+        futures = [
+            test_node(session, node_name, options)
+            for node_name in options.node_names
+        ]
         logging.debug(f"futures: {futures}")
 
         # results = await asyncio.gather(*futures, return_exceptions=True)
@@ -371,6 +425,7 @@ def report(results):
     datastore_durations = [result.datastore_duration for result in results]
     featuretype_durations = [result.featuretype_duration for result in results]
     get_durations = [result.get_duration for result in results]
+    delete_workspace_durations = [result.delete_workspace_duration for result in results]
     latencies = [result.latency for result in results]
 
     for label, variable in [
@@ -378,6 +433,7 @@ def report(results):
         ("Datastore POST durations", datastore_durations),
         ("FeatureType POST durations", featuretype_durations),
         ("GET durations", get_durations),
+        ("DEL durations", delete_workspace_durations),
         ("Latencies", latencies),
     ]:
         if not variable:
@@ -398,9 +454,8 @@ def main():
     parser = argument_parser()
     options = parser.parse_args()
     LOG.debug(f"options: {options}")
-    results = run(test_nodes, options.node_names)
+    results = run(test_nodes, options)
     report(results)
 
 
 main()
-
