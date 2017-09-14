@@ -6,21 +6,23 @@ import time
 import logging
 from textwrap import indent, dedent
 from urllib.parse import urlencode
+from datetime import datetime as Datetime
 import asyncio
 import aiohttp
 from async_timeout import timeout
 
-
-LOG = logging.getLogger("")
-
+LOG = logging.getLogger("post_latency")
 
 def argument_parser():
     parser = argparse.ArgumentParser(
         description="Test some latency thing",
     )
     parser.add_argument(
-        dest="node_names",
-        nargs="+",
+        dest="post_node_name",
+    )
+    parser.add_argument(
+        dest="get_node_names",
+        nargs="*",
     )
     parser.add_argument(
         "--database-host",
@@ -42,6 +44,41 @@ def argument_parser():
         "--database-password",
         default="geoserver",
     )
+    parser.add_argument(
+        "--username",
+        default="admin",
+    )
+    parser.add_argument(
+        "--password",
+        default="geoserver",
+    )
+    parser.add_argument(
+        "--workspace",
+        default="osm",
+    )
+    parser.add_argument(
+        "--datastore",
+        default="openstreetmap",
+    )
+    parser.add_argument(
+        "--layer",
+        default="water",
+    )
+    parser.add_argument(
+        "--test-count",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument(
+        "--max-fails",
+        type=int,
+        default=0.1,
+    )
     return parser
 
 
@@ -49,14 +86,13 @@ class RequestResult:
     """Store data on one request.
     """
     def __init__(self):
+        self.content_type = None
+        self.success = None
         self.status = None
         self.body = None
         self.start = None
+        self.connected = None
         self.end = None
-
-    @property
-    def success(self):
-        return (200 <= self.status <= 299) if self.status else False
 
     @property
     def duration(self):
@@ -65,326 +101,492 @@ class RequestResult:
         return self.end - self.start
 
 
-class NodeResult:
+class TestResult:
     """Store data on one node test.
     """
-    def __init__(self, name, url):
-        self.name = name
-        self.url = url
-        self.workspace_results = None
-        self.datastore_results = None
-        self.featuretype_results = None
-        self.get_results = None
-        self.delete_workspace_results = None
+    def __init__(self, post_node_name, get_node_names):
+        """
+        :arg post_node_name:
+            One string specifying the hostname or hostname:port of the host to
+            issue POST requests to, setting up the test.
+        :arg get_node_names:
+            List of strings specifying hostname or hostname:port for each host
+            to issue polling GET requests to.
+        """
+        self.post_node_name = post_node_name
+        self.get_node_names = get_node_names
 
-    @property
-    def get_result(self):
-        return self.get_results[-1] if self.get_results else None
+        # A list of RequestResult instances representing retries of the POST
+        self.workspace_post_results = None
+        # A dict mapping hostname strings to retries of the GET
+        self.workspace_get_results = None
 
-    @property
-    def workspace_result(self):
-        return self.workspace_results[-1] if self.workspace_results else None
+        self.datastore_post_results = None
+        self.datastore_get_results = None
 
-    @property
-    def datastore_result(self):
-        return self.datastore_results[-1] if self.datastore_results else None
+        self.featuretype_post_results = None
+        self.featuretype_get_results = None
 
-    @property
-    def delete_workspace_result(self):
-        return self.delete_workspace_results[-1] if self.delete_workspace_results else None
+        # How many times did we fail?
+        self.failures = 0
 
-    @property
-    def featuretype_result(self):
-        return self.featuretype_results[-1] if self.featuretype_results else None
+        # Was the test successful overall?
+        self.success = None
 
-    @property
-    def get_duration(self):
-        return self.get_result.duration if self.get_result else None
-
-    @property
-    def workspace_duration(self):
-        return self.workspace_result.duration if self.workspace_result else None
-
-    @property
-    def datastore_duration(self):
-        return self.datastore_result.duration if self.datastore_result else None
-
-    @property
-    def delete_workspace_duration(self):
-        return self.delete_workspace_result.duration if self.delete_workspace_result else None
-
-    @property
-    def featuretype_duration(self):
-        return self.featuretype_result.duration if self.featuretype_result else None
-
-    @property
-    def get_end(self):
-        return self.get_result.end if self.get_result else None
-
-    @property
-    def post_end(self):
-        return (
-            self.featuretype_result.end
-            if self.featuretype_result
-            else None
-        )
-
-    @property
-    def latency(self):
-        if not self.get_results:
-            return None
-
-        get_result = self.get_results[-1]
-        get_end = get_result.end
-
-        get_end, post_end = self.get_end, self.post_end
-        if get_end is None or post_end is None:
-            return None
-        return self.get_end - self.post_end
+        # time.monotonic() timestamps for timing the whole test.
+        self.start = None
+        self.end = None
 
 
-async def retry(label, async_function, args=None, kwargs=None, max_fails=1):
+async def retry(label, async_function, args=None, kwargs=None, max_fails=1,
+                delay=0.1):
+    # default values for args/kwargs which will unpack successfully
     args = args or []
     kwargs = kwargs or {}
 
+    # Get a child logger which prefixes the given label,
+    # e.g. so we have context like node names when reporting failures
+    log = LOG.getChild(label)
+
+    # List of results representing different retries.
+    # If the last one is successful, the whole process succeeded.
+    # Otherwise, the whole process failed.
     results = []
 
+    # Use a finite number of retries
     for fails in range(0, max_fails):
-        LOG.debug(f"{label} Attempt #{fails + 1}")
 
         result = RequestResult()
         results.append(result)
+        now = Datetime.now()
         result.start = time.monotonic()
+
+        log.debug(f"attempt #{fails + 1} at {now}")
 
         # e.g. "async with session.post(url) as response:"
         async with async_function(*args, **kwargs) as response:
-            LOG.debug(f"Response: {response}")
+            result.connected = time.monotonic()
+
+            log.debug(f"response {response}")
+
+            # Record properties of original response for debug
             result.status = response.status
+            result.content_type = response.headers.get("content-type")
+            log.debug(f"status: {result.status}")
 
-            # Madness: 500 to mean resource already exists...
-            # e.g. body = b":Workspace named 'osm' already exists."
-            if result.status == 500:
-                body = await response.read()
-                result.length = len(body)
-                result.type = response.headers.get("content-type")
-                if (
-                    result.type.startswith("text/plain")
-                    and b"already exists" in body
-                ):
-                    LOG.info(f"Magic 500 Body: {body!r}")
-                    # pretend everything is okay, go back to sleep
-                    result.status = 200
-                    result.end = time.monotonic()
-                    break
+            # Record an indicator of whether this was a success
+            # Default success to whether it is a 2xx response.
+            result.success = (200 <= response.status <= 299)
 
-            # If it looks okay so far, let's read it and check it
+            # As a special case, GS may emit a 500 to mean resource already
+            # exists. e.g. body = b":Workspace named 'osm' already exists."
+            # This is an error for us, e.g. workspace wasn't deleted yet,
+            # so we need to just retry until we're done retrying.
+
+            # Read the body so we can report on its length and the total
+            # request handling time.
+            body = await response.read()
+            result.end = time.monotonic()
+            # GS won't give out Content-Length, so just do it all in RAM
+            result.length = len(body)
+
+            if result.length:
+                log.debug(f"length: {result.length}")
+                log.debug(f"content-type: {result.content_type}")
+
+                # Log some body in case something went wrong
+                partial_body = body[:100]
+                log.debug(f"body: {partial_body}")
+
+            # Stop retrying once successful.
             if result.success:
-                body = await response.read()
-
-                result.end = time.monotonic()
-                LOG.debug(f"Response Body: {body}")
-
-                # geoserver doesn't seem to be giving up content-length,
-                # so we'll just keep it all in RAM here, whatever
-                result.length = len(body)
-                result.type = response.headers.get("content-type")
-
-                # Looks good, let's stop retrying
                 break
 
-            LOG.error(f"looks unsuccessful: {result.status}")
+            log.error(f"failure: {result.status}")
 
-            # Stop the timer without bothering to read
-            result.end = time.monotonic()
+            await asyncio.sleep(delay)
 
-            # wait a bit to avoid being rude with very high request volume
-            await asyncio.sleep(1)
+    now = Datetime.now()
+    log.debug(f"retry returning at {now}")
 
     return results
 
+async def delete_workspace(session, options):
+    """
+    """
+    node_name = options.post_node_name
+    url = (
+        f"http://{node_name}/geoserver/rest"
+        f"/workspaces/{options.workspace}"
+        f"?recurse=true"
+    )
+    future = retry(
+        f"workspace.DELETE.{node_name}", session.delete, args=[url],
+        delay=options.delay,
+    )
+    results = await future
+    return results
 
-async def test_node(session, node_name, options):
-    # this coro contains the whole flow for one node
-    # it returns report information on that node at the end
+async def post_workspace(session, options, node_name):
+    """Issue a POST to the master write node to create a workspace.
 
-    max_post_fails = 2
-    max_get_fails = 10
-    max_delete_fails = 2
+    :returns:
+        A list of RequestResult instances, each representing one attempt to
+        perform the request. If the last one was not successful, then the POST
+        was not successful.
+    """
 
-    base_url = f"http://{node_name}/geoserver"
-    query_string = urlencode({
-        "SERVICE": "WMS",
-        "VERSION": "1.3.0",
-        "REQUEST": "GetMap",
-        "FORMAT": "image/png",
-        "TRANSPARENT": "true",
-        "LAYERS": "osm:water",
-        "TILED": "true",
-        "WIDTH": "512",
-        "HEIGHT": "512",
-        "CRS": "EPSG:3857",
-        "STYLES": "",
-        "FORMAT_OPTIONS": "dpi:180",
-    })
-    url = f"{base_url}/wms?{query_string}"
-    bbox = "-8575011.581144214,4709743.934819421,-8574400.084917933,4710355.431045703"
-    url += f"&BBOX={bbox}"
+    # Specifically for POST workspace, we need to retry because there is a
+    # chance that previous workspace deletes have not yet propagated by the
+    # time we start trying to POST a new workspace.
+    max_fails = 1
 
-    result = NodeResult(node_name, url)
-
-    # mystery parameters
-    workspace = "osm"
-    datastore = "openstreetmap"
-    layer_name = "water"
-
-    # Make sure we have an osm workspace I guess
-    workspace_args = [
-        f"{base_url}/rest/workspaces",
-    ]
-    workspace_kwargs = {
-        "headers": {
-            "Content-Type": "text/xml",
-        },
-        "data": f"<workspace><name>{workspace}</name></workspace>",
+    url = f"http://{node_name}/geoserver/rest/workspaces"
+    headers = {
+        "Content-Type": "text/xml",
     }
-    workspace_results = await retry(
-        "POST",
-        session.post,
-        args=workspace_args,
-        kwargs=workspace_kwargs,
-        max_fails=max_post_fails,
-    )
-    result.workspace_results = workspace_results
+    data = f"""
+        <workspace>
+            <name>{options.workspace}</name>
+        </workspace>
+        """.strip()
 
-    if not workspace_results or not workspace_results[-1].success:
-        return result
-
-    # database_host = "osm-test-chesapeake.cs5ahh3rwygg.us-east-1.rds.amazonaws.com"
-    # database_port = "5432"
-    # database_name = "osm"
-    # database_user = "geoserver"
-    # database_password = "geoserver"
-    datastore_args = [
-        f"{base_url}/rest/workspaces/{workspace}/datastores",
-    ]
-    datastore_kwargs = {
-        "headers": {
-            "Content-Type": "text/xml",
+    future = retry(
+        f"workspace.POST.{node_name}", session.post, args=[url], kwargs={
+            "headers": headers,
+            "data": data,
         },
-        # magic parameters
-        "data": f"""
-            <dataStore>
-            <name>openstreetmap</name>
-            <connectionParameters>
-                <host>{options.database_host}</host>
-                <port>{options.database_port}</port>
-                <database>{options.database_name}</database>
-                <user>{options.database_user}</user>
-                <passwd>{options.database_password}</passwd>
-                <dbtype>postgis</dbtype>
-            </connectionParameters>
-            </dataStore>
-        """.strip(),
-    }
-    datastore_results = await retry(
-        "POST",
-        session.post,
-        args=datastore_args,
-        kwargs=datastore_kwargs,
-        max_fails=max_post_fails,
+        max_fails=max_fails,
+        delay=options.delay,
     )
-    result.datastore_results = datastore_results
+    results = await future
+    return results
 
-    if not datastore_results or not datastore_results[-1].success:
-        return result
 
-    featuretype_args = [
-        (
-            f"{base_url}/rest/workspaces/{workspace}"
-            f"/datastores/{datastore}"
-            f"/featuretypes"
-        ),
-    ]
-    featuretype_kwargs = {
-        "headers": {
-            "Content-Type": "text/xml",
+async def get_workspace(options, session, node_name):
+    """Issue polling GETs to a node to determine when workspace is available.
+    """
+
+    # Poll for a while before faliing.
+
+    url = f"http://{node_name}/geoserver/rest/workspaces/{options.workspace}"
+
+    # I don't know why the empty string needs a content-type
+    headers = {
+        "Content-Type": "text/xml",
+    }
+
+    future = retry(
+        f"workspace.GET.{node_name}", session.get, args=[url], kwargs={
+            "headers": headers,
         },
-        "data": f"<featureType><name>{layer_name}</name></featureType>",
+        max_fails=options.max_fails,
+        delay=options.delay,
+    )
+    results = await future
+    return results
+
+
+async def delete_datastore(session, options):
+    """
+    """
+    node_name = options.post_node_name
+    url = (
+        f"http://{node_name}/geoserver/rest"
+        f"/workspaces/{options.workspace}"
+        f"/datastores/{options.datastore}"
+    )
+    future = retry(
+        f"workspace.DELETE.{node_name}", session.delete, args=[url],
+        delay=options.delay,
+    )
+    results = await future
+    return results
+
+
+async def post_datastore(options, session, node_name):
+    """Issue a POST to the master write node to create a datastore.
+
+    :returns:
+        A list of RequestResult instances, each representing one attempt to
+        perform the request. If the last one was not successful, then the POST
+        was not successful.
+    """
+
+    # If POST datastore fails at all, something is already wrong
+    max_fails = 1
+
+    url = (
+        f"http://{node_name}/geoserver/rest"
+        f"/workspaces/{options.workspace}"
+        f"/datastores"
+    )
+    headers = {
+        "Content-Type": "text/xml",
     }
-    featuretype_results = await retry(
-        "POST",
-        session.post,
-        args=featuretype_args,
-        kwargs=featuretype_kwargs,
-        max_fails=max_post_fails,
+    data = f"""
+        <dataStore>
+        <name>openstreetmap</name>
+        <connectionParameters>
+            <host>{options.database_host}</host>
+            <port>{options.database_port}</port>
+            <database>{options.database_name}</database>
+            <user>{options.database_user}</user>
+            <passwd>{options.database_password}</passwd>
+            <dbtype>postgis</dbtype>
+        </connectionParameters>
+        </dataStore>
+        """.strip()
+
+    print("DATASTORE: "+url)
+    print(headers)
+    print(data) 
+    future = retry(
+        f"datastore.POST.{node_name}", session.post, args=[url], kwargs={
+            "headers": headers,
+            "data": data,
+        },
+        max_fails=max_fails,
+        delay=options.delay,
     )
-    result.featuretype_results = featuretype_results
+    results = await future
+    return results
 
-    if not featuretype_results or not featuretype_results[-1].success:
-        return result
 
-    # post_results = await retry(
-    #     "POST",
-    #     session.post,
-    #     args=workspace_args,
-    #     kwargs=workspace_kwargs,
-    #     max_fails=max_post_fails,
-    # )
-    # result.post_results = post_results
+async def get_datastore(options, session, node_name):
+    """Issue polling GETs to a node to determine when datastore is available.
+    """
 
-    # if not post_results or not post_results[-1].success:
-    #     LOG.error(f"No successful POST, skipping GETs: {post_results!r}")
-    #     return result
+    # Poll for a while before faliing.
 
-    get_results = await retry(
-        "GET",
-        session.get,
-        args=[url],
-        kwargs={},
-        max_fails=max_get_fails,
+    url = (
+        f"http://{node_name}/geoserver/rest"
+        f"/workspaces/{options.workspace}"
+        f"/datastores/{options.datastore}"
     )
-    result.get_results = get_results
-    
-    delete_workspace_args = [
-        f"{base_url}/rest/workspaces/{workspace}?recurse=true",
-    ]    
-    delete_results = await retry(
-        "DELETE",
-        session.delete,
-        args=delete_workspace_args,
-        kwargs={},
-        max_fails=max_delete_fails,
+
+    # I don't know why the empty string needs a content-type
+    headers = {
+        "Content-Type": "text/xml",
+    }
+
+    future = retry(
+        f"datastore.GET.{node_name}", session.get, args=[url], kwargs={
+            "headers": headers,
+        },
+        max_fails=options.max_fails,
+        delay=options.delay,
     )
-    result.delete_workspace_results = delete_results
-    return result
+    results = await future
+    return results
 
 
-async def test_nodes(options):
+async def delete_featuretype(session, options):
+    """
+    """
+    node_name = options.post_node_name
+    url = (
+        f"http://{node_name}/geoserver/rest"
+        f"/workspaces/{options.workspace}"
+        f"/datastores/{options.datastore}"
+        f"/featuretypes/{options.layer}"
+    )
+    future = retry(
+        f"workspace.DELETE.{node_name}", session.delete, args=[url],
+        delay=options.delay,
+    )
+    results = await future
+    return results
 
-    # this coro runs test_node once for each node
-    # it aggregates their report information
 
-    results = []
-    start = time.monotonic()
 
-    username = "admin"  # ??
-    password = "geoserver"
-    auth = aiohttp.BasicAuth(username, password)
-    async with aiohttp.ClientSession(auth=auth) as session:
+async def post_featuretype(options, session, node_name):
+    """Issue a POST to the master write node to create a featuretype.
 
-        futures = [
-            test_node(session, node_name, options)
-            for node_name in options.node_names
+    :returns:
+        A list of RequestResult instances, each representing one attempt to
+        perform the request. If the last one was not successful, then the POST
+        was not successful.
+    """
+
+    # If POST featuretype fails at all, something is already wrong
+    max_fails = 1
+
+    url = (
+        f"http://{node_name}/geoserver/rest"
+        f"/workspaces/{options.workspace}"
+        f"/datastores/{options.datastore}"
+        f"/featuretypes?recalculate=nativebbox,latlonbbox"
+    )
+    headers = {
+        "Content-Type": "text/xml",
+    }
+    data = f"""
+        <featureType>
+            <name>{options.layer}</name>
+        </featureType>
+        """.strip()
+
+    future = retry(
+        f"featuretype.POST.{node_name}", session.post, args=[url], kwargs={
+            "headers": headers,
+            "data": data,
+        },
+        max_fails=max_fails,
+        delay=options.delay,
+    )
+    results = await future
+    return results
+
+
+async def get_featuretype(options, session, node_name):
+    """Issue polling GETs to a node to determine when featuretype is available.
+    """
+
+    # Poll for a while before faliing.
+
+    url = (
+        f"http://{node_name}/geoserver/rest"
+        f"/workspaces/{options.workspace}"
+        f"/datastores/{options.datastore}"
+        f"/featuretypes/{options.layer}"
+    )
+
+    # I don't know why the empty string needs a content-type
+    headers = {
+        "Content-Type": "text/xml",
+    }
+
+    future = retry(
+        f"featuretype.GET.{node_name}", session.get, args=[url], kwargs={
+            "headers": headers,
+        },
+        max_fails=options.max_fails,
+        delay=options.delay,
+    )
+    results = await future
+    return results
+
+
+async def test(options, label):
+
+    # Create object used for HTTP basic authentication using command line args
+    auth = aiohttp.BasicAuth(options.username, options.password)
+
+    # Create object to store all results for test
+    test_result = TestResult(options.post_node_name, options.get_node_names)
+
+    # Timing for the whole test
+    # For most reporting we'll prefer to use actual request timings, so ew
+    # don't include client setup time
+    test_result.start = time.monotonic()
+
+    # TODO: fix conn_timeout
+    async with aiohttp.ClientSession(
+        auth=auth, conn_timeout=5, read_timeout=5,
+    ) as session:
+
+        # Preparatory cleanup
+
+        results = await delete_featuretype(session, options)
+        LOG.debug(f"DELETE featuretype results {results}")
+
+        results = await delete_datastore(session, options)
+        LOG.debug(f"DELETE datastore results {results}")
+
+        results = await delete_workspace(session, options)
+        LOG.debug(f"DELETE workspace results {results}")
+
+        await asyncio.sleep(10)
+
+        # Create a bunch of futures. Coroutine execution doesn't start yet.
+
+        node_names = [options.post_node_name] + options.get_node_names
+
+        workspace_get_futures = [
+            get_workspace(options, session, node_name)
+            for node_name in node_names
         ]
-        logging.debug(f"futures: {futures}")
+        workspace_post_future = post_workspace(
+            session, options, options.post_node_name
+        )
+        futures = [workspace_post_future] + workspace_get_futures
 
-        # results = await asyncio.gather(*futures, return_exceptions=True)
+        # Start all the futures at the same time.
+        #
+        # await actually schedules the futures, then we go to sleep,
+        # and once they've all ripened, the scheduler wakes us up again.
+        #
+        # Since we used gather, results will be in the same order.
+
         results = await asyncio.gather(*futures)
 
-    end = time.monotonic()
-    duration = round(end - start, 4)
-    LOG.debug(f"Finished in {duration}s.\n")
-    return results
+        post_results, *all_get_results = results
+        get_results = {
+            node_names[index]: all_get_results[index]
+            for index in range(0, len(all_get_results))
+        }
+
+        test_result.workspace_post_results = post_results
+        test_result.workspace_get_results = get_results
+
+        # Log how many tries we had
+        LOG.debug(f"{len(post_results)} POST workspace results")
+        LOG.debug(f"{len(get_results)} GET workspace results:")
+        for get_node_name, results in sorted(get_results.items()):
+            LOG.debug(f"    {get_node_name}: {len(results)} results")
+
+        # Rinse, repeat for datastore
+        datastore_get_futures = [
+            get_datastore(options, session, node_name)
+            for node_name in node_names
+        ]
+        datastore_post_future = post_datastore(
+            options, session, options.post_node_name
+        )
+        futures = [datastore_post_future] + datastore_get_futures
+        results = await asyncio.gather(*futures)
+        post_results, *all_get_results = results
+        get_results = {
+            node_names[index]: all_get_results[index]
+            for index in range(0, len(all_get_results))
+        }
+        test_result.datastore_post_results = post_results
+        test_result.datastore_get_results = get_results
+        LOG.debug(f"{len(post_results)} POST datastore results")
+        LOG.debug(f"{len(get_results)} GET datastore results:")
+        for get_node_name, results in sorted(get_results.items()):
+            LOG.debug(f"    {get_node_name}: {len(results)} results")
+
+        # Rinse, repeat for featuretype
+        featuretype_get_futures = [
+            get_featuretype(options, session, node_name)
+            for node_name in node_names
+        ]
+        featuretype_post_future = post_featuretype(
+            options, session, options.post_node_name
+        )
+        futures = [featuretype_post_future] + featuretype_get_futures
+        results = await asyncio.gather(*futures)
+        post_results, *all_get_results = results
+        get_results = {
+            node_names[index]: all_get_results[index]
+            for index in range(0, len(all_get_results))
+        }
+        test_result.featuretype_post_results = post_results
+        test_result.featuretype_get_results = get_results
+        LOG.debug(f"{len(post_results)} POST featuretype results")
+        LOG.debug(f"{len(get_results)} GET featuretype results:")
+        for get_node_name, results in sorted(get_results.items()):
+            LOG.debug(f"    {get_node_name}: {len(results)} results")
+
+    test_result.end = time.monotonic()
+
+    # Debug report on the completion and timing of the whole process
+    duration = round(test_result.end - test_result.start, 4)
+    LOG.debug(f"Test for {options.post_node_name} finished in {duration}s.")
+
+    return test_result
 
 
 def summary_text(values):
@@ -403,7 +605,48 @@ def summary_text(values):
     return text
 
 
+LATENCY_NAMES = [
+    "end-end",
+    "end-start",
+    "end-conn",
+    "start-end",
+    "start-start",
+    "start-conn",
+    "conn-end",
+    "conn-start",
+    "conn-conn",
+]
+
+
+def latency_dict(last_get, last_post):
+    latencies = {}
+    if last_get.end is not None:
+        if last_post.end is not None:
+            latencies["end-end"] = last_get.end - last_post.end
+        if last_post.start is not None:
+            latencies["end-start"] = last_get.end - last_post.start
+        if last_post.connected is not None:
+            latencies["end-conn"] = last_get.end - last_post.connected
+    if last_get.start is not None:
+        if last_post.end is not None:
+            latencies["start-end"] = last_get.start - last_post.end
+        if last_post.start is not None:
+            latencies["start-start"] = last_get.start - last_post.start
+        if last_post.connected is not None:
+            latencies["start-conn"] = last_get.start - last_post.connected
+    if last_get.connected is not None:
+        if last_post.end is not None:
+            latencies["conn-end"] = last_get.connected - last_post.end
+        if last_post.start is not None:
+            latencies["conn-start"] = last_get.connected - last_post.start
+        if last_post.connected is not None:
+            latencies["conn-conn"] = last_get.connected - last_post.connected
+    return latencies
+
+
 def report(results):
+    tab = " " * 4
+
     for result in results:
         if isinstance(result, Exception):
             logging.exception(result)
@@ -413,49 +656,184 @@ def report(results):
         if not isinstance(result, Exception)
     ]
 
+    if not results:
+        print("No results to display.")
+        return
+
+    all_latencies = {}
+
     for index, result in enumerate(results, 1):
+        test_duration = round(result.end - result.start, 3)
+
         paragraph = dedent(f"""
-            Node #{index}: {result.name}
-                url {result.url}
-                latency {result.latency}
-        """).strip()
+
+            Test #{index}
+            Test Host: {result.post_node_name}
+            Test Duration: {test_duration}s
+            Test Results:
+            """.rstrip())
         print(paragraph)
 
-    workspace_durations = [result.workspace_duration for result in results]
-    datastore_durations = [result.datastore_duration for result in results]
-    featuretype_durations = [result.featuretype_duration for result in results]
-    get_durations = [result.get_duration for result in results]
-    delete_workspace_durations = [result.delete_workspace_duration for result in results]
-    latencies = [result.latency for result in results]
+        tups = [
+            (
+                "Workspace",
+                result.workspace_post_results,
+                result.workspace_get_results,
+            ),
+            (
+                "Datastore",
+                result.datastore_post_results,
+                result.datastore_get_results,
+            ),
+            (
+                "Featuretype",
+                result.featuretype_post_results,
+                result.featuretype_get_results,
+            ),
+        ]
+        for label, post_results, get_results in tups:
 
-    for label, variable in [
-        ("Workspace POST durations", workspace_durations),
-        ("Datastore POST durations", datastore_durations),
-        ("FeatureType POST durations", featuretype_durations),
-        ("GET durations", get_durations),
-        ("DEL durations", delete_workspace_durations),
-        ("Latencies", latencies),
-    ]:
-        if not variable:
-            print("no data to report")
-        else:
-            print(f"\n{label}")
-            print(indent(summary_text(variable), "  "))
+            # e.g. "Datastore:"
+            line = indent(f"{label}:", tab)
+            print(line)
+
+            last_post = post_results[-1] if post_results else None
+            last_gets = {
+                key: (results[-1] if results else None)
+                for key, results in get_results.items()
+            }
+
+            # If there are no results for e.g. datastore, it's a failure
+            if not post_results:
+                line = indent("POST: failure - no results", tab * 2)
+                print(line)
+
+            # Otherwise, if the last POST succeeded, test succeeded overall.
+            # The fail count is the number of preceding POST retry results
+            else:
+                post_success = "success" if last_post.success else "failure"
+                post_fail_count = sum(
+                    (1 if result and not result.success else 0)
+                    for result in post_results
+                )
+                post_missing_count = sum(
+                    (1 if not result else 0)
+                    for result in post_results
+                )
+                line = indent(
+                    f"POST: "
+                    f"{post_success} "
+                    f"fails={post_fail_count} ",
+                    tab * 2
+                )
+                print(line)
+
+                print(indent("Durations:", tab * 3))
+                post_durations = [result.duration for result in post_results]
+                if len(post_durations) == 1:
+                    print(indent(f"{post_durations[-1]}", tab * 4))
+                else:
+                    print(indent(summary_text(post_durations), tab * 4))
 
 
-def run(async_function, *args, **kwargs):
-    return asyncio.get_event_loop().run_until_complete(
-        async_function(*args, **kwargs)
-    )
+            if not get_results:
+                line = indent("GET: failure - no results", tab * 2)
+                print(line)
+            else:
+                get_success = {
+                    key: value.success if value else False
+                    for key, value in last_gets.items()
+                }
+                get_success_count = sum(
+                    (1 if value else 0)
+                    for value in get_success.values()
+                )
+                line = indent(
+                    f"GET: {get_success_count} successful host(s)",
+                    tab * 2
+                )
+                print(line)
+
+                for name, values in sorted(get_results.items()):
+                    if not values:
+                        print(indent(f"{name}: no results", tab * 3))
+                        continue
+
+                    last_get = values[-1]
+                    success = "success" if last_get.success else "failure"
+                    fails = sum(
+                        (0 if result and result.success else 1)
+                        for result in values
+                    )
+                    durations = [result.duration for result in values]
+                    paragraph = indent(dedent(f"""
+                        {name}: {success} fails={fails}
+                        """).strip(), tab * 3)
+                    print(paragraph)
+
+                    print(indent("Durations:", tab * 4))
+                    if len(durations) == 1:
+                        print(indent(f"{durations[-1]}", tab * 4))
+                    else:
+                        paragraph = indent(summary_text(durations), tab * 5)
+                        print(paragraph)
+
+                    if last_get and last_get.success and last_post and last_post.success:
+
+                        print(indent("Latencies:", tab * 4))
+                        latencies = latency_dict(last_get, last_post)
+                        for latency_name, value in sorted(latencies.items()):
+                            print(indent(f"{latency_name} = {value}", tab * 5))
+
+                        existing = all_latencies.setdefault((name, label), {})
+                        for key, value in latencies.items():
+                            values = existing.setdefault(key, [])
+                            values.append(value)
+
+    print("Combined Latencies")
+    tuples = list(all_latencies.keys())
+    names = sorted(set([tup[0] for tup in tuples]))
+    labels = sorted(set([tup[1] for tup in tuples]))
+    for name in names:
+        print("=" * len(name))
+        print(f"{name}")
+        print("=" * len(name))
+        for label in labels:
+            print(indent(f"{label}", tab * 1))
+            print(indent("-" * len(label), tab * 1))
+            key = (name, label)
+            latencies = all_latencies.get(key)
+            for latency_name in LATENCY_NAMES:
+                print(indent(f"{latency_name}", tab * 2))
+                values = latencies.get(latency_name) or []
+                if values:
+                    print(indent(summary_text(values), tab * 3))
 
 
 def main():
+    # Configure logging: we want debug messages from almost everything,
+    # but we only want important information from asyncio itself
     logging.basicConfig(level=logging.DEBUG)
+    logging.getLogger("asyncio").setLevel(logging.INFO)
+
+    # Parse command line arguments
     parser = argument_parser()
     options = parser.parse_args()
     LOG.debug(f"options: {options}")
-    results = run(test_nodes, options)
-    report(results)
+
+    # Run coroutines
+    loop = asyncio.get_event_loop()
+
+    test_results = []
+    try:
+        for index in range(0, options.test_count):
+            test_result = loop.run_until_complete(test(options, index + 1))
+            test_results.append(test_result)
+    except KeyboardInterrupt:
+        print(f"collected {len(test_results)} test results before interruption")
+
+    # Output formatted summarized results
+    report(test_results)
 
 
 main()

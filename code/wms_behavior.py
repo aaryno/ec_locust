@@ -2,6 +2,8 @@
 """
 from urllib.parse import urlencode
 from locust import TaskSet
+import datetime
+import time
 
 
 class WMSBehavior(TaskSet):
@@ -119,10 +121,20 @@ class WMSBehavior(TaskSet):
         # Build URL ourselves since requests insists on encoding commas
         # in querystrings, grumble grumble
         url = "{}?{}&bbox={}".format(uri, urlencode(parameters), bbox)
-        return self.client.get(
+        map=self.client.get(
             url,
             name=name,
             # mark everything failed unless it's explicitly marked successful,
             # since 200 doesn't mean anything in this postmodern era
             catch_response=True,
         )
+
+        content_type="None"
+        if map.headers is not None:
+            content_type=map.headers.get("content-type")
+        if content_type != "image/png;charset=UTF-8":
+            map.failure("Got wrong content-type")
+            map.status_code=469
+        st = datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S')
+        print(st+"\t"+url+"\t"+content_type+"\t"+str(map.status_code))
+        return map
